@@ -2,50 +2,126 @@
 #include "TextUtils.hpp"
 #include <algorithm>
 #include <iostream>
+#include <future>
 
 namespace {
-    // Pesos de importancia por campo (decision documentada en docs/ARQUITECTURA.md):
-    // una coincidencia en el TITULO es mucho mas relevante que una en la
-    // sinopsis (una pelicula titulada "El Barco Fantasma" es casi con
-    // certeza lo que alguien busca al escribir "barco fantasma", aunque la
-    // palabra tambien aparezca de pasada en la sinopsis de otras 50 peliculas).
     constexpr int PESO_TITULO = 5;
     constexpr int PESO_PLOT   = 1;
     constexpr int PESO_TAG    = 4;
 
-    // Bono por cada palabra ADICIONAL de la consulta que matchea en la misma
-    // pelicula (para que una coincidencia de frase completa "barco fantasma"
-    // supere a una pelicula que solo menciona "barco" muchisimas veces).
-    constexpr int BONO_POR_TERMINO_EXTRA = 50;
+    class FullTextQuery : public ISearchQuery {
+    public:
+        std::vector<SearchResult> execute(const SearchEngine& engine, const std::string& query) const override {
+            return engine.searchText(query);
+        }
+    };
+
+    class TagQuery : public ISearchQuery {
+        TagField field_;
+    public:
+        explicit TagQuery(TagField field) : field_(field) {}
+        std::vector<SearchResult> execute(const SearchEngine& engine, const std::string& query) const override {
+            return engine.searchTag(query, field_);
+        }
+    };
 }
 
-SearchEngine::SearchEngine(const std::vector<Movie>& movies) : movies_(movies) {}
+// --- Implementacion Factory Method ---
+std::unique_ptr<ISearchQuery> SearchQueryFactory::create(Type type) {
+    switch (type) {
+        case Type::Text:     return std::make_unique<FullTextQuery>();
+        case Type::Director: return std::make_unique<TagQuery>(TagField::Director);
+        case Type::Cast:     return std::make_unique<TagQuery>(TagField::Cast);
+        case Type::Genre:    return std::make_unique<TagQuery>(TagField::Genre);
+    }
+    return std::make_unique<FullTextQuery>();
+}
+
+// --- Implementacion Singleton ---
+StreamingAppSingleton::StreamingAppSingleton() = default;
+StreamingAppSingleton::~StreamingAppSingleton() = default;
+
+StreamingAppSingleton& StreamingAppSingleton::getInstance() {
+    static StreamingAppSingleton instance;
+    return instance;
+}
+
+void StreamingAppSingleton::initialize(std::vector<Movie>&& movies) {
+    movies_ = std::move(movies);
+    engine_ = std::make_unique<SearchEngine>(movies_);
+    engine_->buildIndexes();
+}
+
+// --- Implementacion SearchEngine ---
+SearchEngine::SearchEngine(const std::vector<Movie>& movies)
+    : movies_(movies),
+      rankingStrategy_(std::make_unique<DefaultRankingStrategy>()) {}
+
+void SearchEngine::setRankingStrategy(std::unique_ptr<IRankingStrategy> strategy) {
+    if (strategy) {
+        rankingStrategy_ = std::move(strategy);
+    }
+}
 
 void SearchEngine::buildIndexes() {
-    for (const auto& m : movies_) {
-        contentIndex_.indexTokens(m.id, TextUtils::tokenize(m.title), PESO_TITULO);
-        contentIndex_.indexTokens(m.id, TextUtils::tokenize(m.plot),  PESO_PLOT);
+    // Programacion paralela: los 4 indices y sus SuffixTries se construyen
+    // concurrentemente en hilos separados usando std::async.
+    auto fContent = std::async(std::launch::async, [this]() {
+        for (const auto& m : movies_) {
+            contentIndex_.indexTokens(m.id, TextUtils::tokenize(m.title), PESO_TITULO);
+            contentIndex_.indexTokens(m.id, TextUtils::tokenize(m.plot),  PESO_PLOT);
+        }
+        contentIndex_.build();
+    });
 
-        if (!m.director.empty())
-            directorIndex_.indexTokens(m.id, TextUtils::tokenize(m.director), PESO_TAG);
-        if (!m.castTokens.empty())
-            castIndex_.indexTokens(m.id, m.castTokens, PESO_TAG);
-        if (!m.genreTokens.empty())
-            genreIndex_.indexTokens(m.id, m.genreTokens, PESO_TAG);
-    }
-    contentIndex_.build();
-    directorIndex_.build();
-    castIndex_.build();
-    genreIndex_.build();
+    auto fDirector = std::async(std::launch::async, [this]() {
+        for (const auto& m : movies_) {
+            if (!m.director.empty())
+                directorIndex_.indexTokens(m.id, TextUtils::tokenize(m.director), PESO_TAG);
+        }
+        directorIndex_.build();
+    });
+
+    auto fCast = std::async(std::launch::async, [this]() {
+        for (const auto& m : movies_) {
+            if (!m.castTokens.empty())
+                castIndex_.indexTokens(m.id, m.castTokens, PESO_TAG);
+        }
+        castIndex_.build();
+    });
+
+    auto fGenre = std::async(std::launch::async, [this]() {
+        for (const auto& m : movies_) {
+            if (!m.genreTokens.empty())
+                genreIndex_.indexTokens(m.id, m.genreTokens, PESO_TAG);
+        }
+        genreIndex_.build();
+    });
+
+    fContent.get();
+    fDirector.get();
+    fCast.get();
+    fGenre.get();
 }
 
 std::vector<SearchResult> SearchEngine::rankAndCombine(const std::vector<std::string>& queryTokens,
                                                         const TextIndex& index) const {
-    // movieId -> (score acumulado, cuantos terminos distintos matchearon)
-    std::unordered_map<int, std::pair<int,int>> acc;
+    if (queryTokens.empty()) return {};
+
+    // Programacion paralela: cada palabra de la consulta se busca en el
+    // SuffixTrie en paralelo y luego se combinan los mapas de puntaje.
+    std::vector<std::future<TextIndex::ScoreMap>> futures;
+    futures.reserve(queryTokens.size());
 
     for (const auto& term : queryTokens) {
-        auto hits = index.searchSubstring(term);
+        futures.push_back(std::async(std::launch::async, [&index, &term]() {
+            return index.searchSubstring(term);
+        }));
+    }
+
+    std::unordered_map<int, std::pair<int, int>> acc;
+    for (auto& fut : futures) {
+        auto hits = fut.get();
         for (const auto& [movieId, weight] : hits) {
             auto& entry = acc[movieId];
             entry.first  += weight;
@@ -53,22 +129,8 @@ std::vector<SearchResult> SearchEngine::rankAndCombine(const std::vector<std::st
         }
     }
 
-    std::vector<SearchResult> results;
-    results.reserve(acc.size());
-    for (const auto& [movieId, scoreAndCount] : acc) {
-        int importancia = scoreAndCount.first + BONO_POR_TERMINO_EXTRA * (scoreAndCount.second - 1);
-        results.push_back({movieId, importancia, scoreAndCount.second});
-    }
-
-    // Orden de importancia: primero por cuantos terminos de la consulta
-    // matcheo (cobertura de la frase), luego por el score acumulado, y
-    // como ultimo criterio de desempate, la pelicula mas reciente primero.
-    std::sort(results.begin(), results.end(), [this](const SearchResult& a, const SearchResult& b) {
-        if (a.matchedTerms != b.matchedTerms) return a.matchedTerms > b.matchedTerms;
-        if (a.score != b.score) return a.score > b.score;
-        return movies_[a.movieId].releaseYear > movies_[b.movieId].releaseYear;
-    });
-    return results;
+    // Delegar el ordenamiento al patron Strategy activo
+    return rankingStrategy_->rank(acc, movies_);
 }
 
 std::vector<SearchResult> SearchEngine::searchText(const std::string& query) const {

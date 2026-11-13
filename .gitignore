@@ -3,3 +3,15 @@ cmake-build-*/
 *.o
 user_profile.txt
 data/wiki_movie_plots_deduped.csv
+
+.idea/
+build/
+cmake-build-*/
+user_profile.txt
+data/wiki_movie_plots_deduped.csv
+
+.idea/
+build/
+cmake-build-*/
+user_profile.txt
+data/wiki_movie_plots_deduped.csv

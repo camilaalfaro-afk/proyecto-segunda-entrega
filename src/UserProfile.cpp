@@ -4,14 +4,32 @@
 #include <algorithm>
 #include <unordered_set>
 #include <unordered_map>
+#include <future>
+#include <thread>
 
 UserProfile::UserProfile(std::string path) : path_(std::move(path)) {
     load();
 }
 
+void UserProfile::addObserver(IProfileObserver* observer) {
+    if (observer && std::find(observers_.begin(), observers_.end(), observer) == observers_.end()) {
+        observers_.push_back(observer);
+    }
+}
+
+void UserProfile::removeObserver(IProfileObserver* observer) {
+    observers_.erase(std::remove(observers_.begin(), observers_.end(), observer), observers_.end());
+}
+
+void UserProfile::notifyObservers() {
+    for (auto* obs : observers_) {
+        obs->onProfileUpdated();
+    }
+}
+
 void UserProfile::load() {
     std::ifstream in(path_);
-    if (!in.is_open()) return; // primera vez que se corre el programa
+    if (!in.is_open()) return;
 
     std::string line;
     enum class Section { None, Likes, WatchLater } section = Section::None;
@@ -23,13 +41,13 @@ void UserProfile::load() {
             int id = std::stoi(line);
             if (section == Section::Likes && liked_.insert(id).second) likedOrder_.push_back(id);
             if (section == Section::WatchLater && watchLater_.insert(id).second) watchLaterOrder_.push_back(id);
-        } catch (...) { /* linea corrupta: se ignora */ }
+        } catch (...) {}
     }
 }
 
 void UserProfile::save() const {
     std::ofstream out(path_, std::ios::trunc);
-    if (!out.is_open()) return; // no se pudo persistir; no es fatal para la sesion actual
+    if (!out.is_open()) return;
     out << "LIKES\n";
     for (int id : likedOrder_) out << id << "\n";
     out << "WATCHLATER\n";
@@ -37,26 +55,34 @@ void UserProfile::save() const {
 }
 
 void UserProfile::like(int movieId) {
-    if (liked_.insert(movieId).second) likedOrder_.push_back(movieId);
-    save();
+    if (liked_.insert(movieId).second) {
+        likedOrder_.push_back(movieId);
+        save();
+        notifyObservers();
+    }
 }
 
 void UserProfile::unlike(int movieId) {
     if (liked_.erase(movieId)) {
         likedOrder_.erase(std::remove(likedOrder_.begin(), likedOrder_.end(), movieId), likedOrder_.end());
         save();
+        notifyObservers();
     }
 }
 
 void UserProfile::addToWatchLater(int movieId) {
-    if (watchLater_.insert(movieId).second) watchLaterOrder_.push_back(movieId);
-    save();
+    if (watchLater_.insert(movieId).second) {
+        watchLaterOrder_.push_back(movieId);
+        save();
+        notifyObservers();
+    }
 }
 
 void UserProfile::removeFromWatchLater(int movieId) {
     if (watchLater_.erase(movieId)) {
         watchLaterOrder_.erase(std::remove(watchLaterOrder_.begin(), watchLaterOrder_.end(), movieId), watchLaterOrder_.end());
         save();
+        notifyObservers();
     }
 }
 
@@ -64,17 +90,14 @@ bool UserProfile::isLiked(int movieId) const { return liked_.count(movieId) > 0;
 bool UserProfile::isInWatchLater(int movieId) const { return watchLater_.count(movieId) > 0; }
 
 double UserProfile::similarity(const Movie& a, const Movie& b) {
-    // Conjunto de "atributos" de cada pelicula: generos + director + cada
-    // actor/actriz del reparto, cada uno con un prefijo para no confundir,
-    // por ejemplo, un genero llamado igual que un actor.
     std::unordered_set<std::string> setA, setB;
-    for (auto& g : a.genreTokens) setA.insert("g:" + g);
-    for (auto& c : a.castTokens)  setA.insert("c:" + c);
-    if (!a.director.empty())      setA.insert("d:" + a.director);
+    for (const auto& g : a.genreTokens) setA.insert("g:" + g);
+    for (const auto& c : a.castTokens)  setA.insert("c:" + c);
+    if (!a.director.empty())            setA.insert("d:" + a.director);
 
-    for (auto& g : b.genreTokens) setB.insert("g:" + g);
-    for (auto& c : b.castTokens)  setB.insert("c:" + c);
-    if (!b.director.empty())      setB.insert("d:" + b.director);
+    for (const auto& g : b.genreTokens) setB.insert("g:" + g);
+    for (const auto& c : b.castTokens)  setB.insert("c:" + c);
+    if (!b.director.empty())            setB.insert("d:" + b.director);
 
     if (setA.empty() || setB.empty()) return 0.0;
 
@@ -86,31 +109,50 @@ double UserProfile::similarity(const Movie& a, const Movie& b) {
 }
 
 std::vector<int> UserProfile::recommendSimilarToLikes(const std::vector<Movie>& allMovies, size_t topN) const {
-    if (likedOrder_.empty()) return {};
+    if (likedOrder_.empty() || allMovies.empty()) return {};
 
-    // Para cada candidata (que no sea ya Like ni Ver-mas-tarde), la
-    // similitud final es la MAXIMA similitud contra cualquiera de las
-    // peliculas que el usuario marco con Like (asi, si le gusto una
-    // comedia y un western, recomendamos lo mejor de ambos mundos, en vez
-    // de diluir el puntaje promediando gustos opuestos).
-    std::unordered_map<int, double> mejorScore;
-    for (int likedId : likedOrder_) {
-        if (likedId < 0 || likedId >= static_cast<int>(allMovies.size())) continue;
-        const Movie& liked = allMovies[likedId];
-        for (const Movie& candidate : allMovies) {
-            if (candidate.id == likedId) continue;
-            if (liked_.count(candidate.id) || watchLater_.count(candidate.id)) continue;
-            double s = similarity(liked, candidate);
-            if (s <= 0.0) continue;
-            auto it = mejorScore.find(candidate.id);
-            if (it == mejorScore.end() || s > it->second) mejorScore[candidate.id] = s;
-        }
+    unsigned int numThreads = std::max(1u, std::thread::hardware_concurrency());
+    size_t chunkSize = (allMovies.size() + numThreads - 1) / numThreads;
+    std::vector<std::future<std::vector<std::pair<int, double>>>> futures;
+
+    for (unsigned int t = 0; t < numThreads; ++t) {
+        size_t start = t * chunkSize;
+        if (start >= allMovies.size()) break;
+        size_t end = std::min(start + chunkSize, allMovies.size());
+
+        futures.push_back(std::async(std::launch::async, [this, &allMovies, start, end]() {
+            std::vector<std::pair<int, double>> localScores;
+            for (size_t idx = start; idx < end; ++idx) {
+                const Movie& candidate = allMovies[idx];
+                if (liked_.count(candidate.id) || watchLater_.count(candidate.id)) continue;
+
+                double maxSim = 0.0;
+                for (int likedId : likedOrder_) {
+                    if (likedId < 0 || likedId >= static_cast<int>(allMovies.size())) continue;
+                    double s = similarity(allMovies[likedId], candidate);
+                    if (s > maxSim) maxSim = s;
+                }
+                if (maxSim > 0.0) {
+                    localScores.emplace_back(candidate.id, maxSim);
+                }
+            }
+            return localScores;
+        }));
     }
 
-    std::vector<std::pair<int,double>> ranked(mejorScore.begin(), mejorScore.end());
-    std::sort(ranked.begin(), ranked.end(), [](auto& a, auto& b) { return a.second > b.second; });
+    std::vector<std::pair<int, double>> ranked;
+    for (auto& fut : futures) {
+        auto partial = fut.get();
+        ranked.insert(ranked.end(), partial.begin(), partial.end());
+    }
+
+    std::sort(ranked.begin(), ranked.end(), [](const auto& a, const auto& b) {
+        return a.second > b.second;
+    });
 
     std::vector<int> result;
-    for (size_t i = 0; i < ranked.size() && i < topN; ++i) result.push_back(ranked[i].first);
+    for (size_t i = 0; i < ranked.size() && i < topN; ++i) {
+        result.push_back(ranked[i].first);
+    }
     return result;
 }
