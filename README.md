@@ -1,4 +1,4 @@
-# Programación III: Proyecto Final (2026-2)
+# Programación III: Proyecto Final (2026-2) — Segunda Entrega
 
 ## Integrantes (5)
 * Dylan van Oordt Arbulú
@@ -8,62 +8,75 @@
 * John Dayron Blas Huete
 
 ---
+## Estructura del repositorio
+
+---
 
 ## Plataforma de Streaming — Buscador y visualizador de sinopsis de películas
 
-Programa en C++17 que carga una base de datos de películas desde un `.csv`, la indexa en un **Trie de sufijos** para búsqueda rápida por palabra, frase o sub-cadena (y por tag: director/actor/género), calcula una **importancia** para ordenar los resultados, y permite marcar películas como **Like** o **Ver más tarde**, con **recomendaciones** basadas en los Likes del usuario. Todo el programa (lectura del CSV incluida) está escrito en C++, sin librerías externas.
+Aplicación de escritorio en **C++17** que carga una base de datos de películas desde un `.csv`, la indexa en paralelo mediante un **Trie de sufijos (`SuffixTrie`)** para búsqueda rápida por palabra, frase o sub-cadena (y por tag: director/actor/género), ordena los resultados mediante estrategias intercambiables de importancia, y ofrece una **interfaz gráfica (Dear ImGui + GLFW + OpenGL3)** para explorar sinopsis, gestionar **Likes** / **Ver más tarde** y recibir **recomendaciones** en tiempo real.
 
-Este `README.md` documenta la entrega. El detalle de diseño y justificación de la estructura de árbol está en [`docs/ARQUITECTURA.md`](docs/ARQUITECTURA.md), y el mapeo punto por punto contra el enunciado del proyecto está en [`docs/RUBRICA.md`](docs/RUBRICA.md).
+El detalle de diseño y justificación de la estructura de árbol se encuentra en [`docs/ARQUITECTURA.md`](docs/ARQUITECTURA.md), y el mapeo contra el enunciado en [`docs/RUBRICA.md`](docs/RUBRICA.md).
 
-### Dataset
+---
 
-Se usó el dataset de Wikipedia Movie Plots (`wiki_movie_plots_deduped.csv`, ~35,000 películas, columnas: `Release Year, Title, Origin/Ethnicity, Director, Cast, Genre, Wiki Page, Plot`). Descárguenlo y colóquenlo en `data/wiki_movie_plots_deduped.csv` (no se incluye en el repositorio por su tamaño, ~78 MB — agréguenlo a `.gitignore` o usen Git LFS si su curso lo permite).
+## Novedades de la Segunda Entrega
 
-**Preprocesamiento aplicado** (responsabilidad del grupo, según el enunciado):
-- Filas sin título se descartan.
-- `Genre`/`Director` con valor `"unknown"` o vacío se normalizan a cadena vacía (se tratan como "sin dato" en vez de como una categoría real, ya que "unknown" no debería competir en una búsqueda por género).
-- Texto normalizado a minúsculas, sin tildes/diacríticos comunes, separado en palabras alfanuméricas — igual para el texto indexado y para las consultas del usuario, para que ambos lados calcen.
-- `Cast` y `Genre` (que vienen como listas separadas por comas, ej. `"Comedy, Drama"`) se separan en tokens individuales.
+### 1. Estructura de Árbol (`SuffixTrie` + Índice Invertido)
+* Implementado en `include/SuffixTrie.hpp` y `src/SuffixTrie.cpp`.
+* Indexa todos los sufijos de cada palabra única del vocabulario (~138,600 palabras $\rightarrow$ ~858,000 nodos contiguos en un `std::vector<Node>`), permitiendo encontrar coincidencias por sub-cadena interna (ej. `"obber"` $\rightarrow$ `"robbery"`) en tiempo proporcional al largo de la consulta.
+* Incluye deduplicación $O(1)$ amortizada mediante `lastWordId` para evitar entradas repetidas en palabras con caracteres recurrentes.
 
-### Cómo compilar y correr
+### 2. Patrones de Diseño Implementados (`include/DesignPatterns.hpp`)
+1. **Singleton (`StreamingAppSingleton`)**: Garantiza una única instancia compartida en memoria del catálogo de películas y del motor de búsqueda (`SearchEngine`), evitando duplicar el `SuffixTrie` entre la lógica y la interfaz gráfica.
+2. **Factory Method (`SearchQueryFactory`)**: Encapsula la instanciación de consultas (`FullTextQuery` y `TagQuery` para director, reparto o género), desacoplando la interfaz gráfica de la lógica de filtrado.
+3. **Strategy (`IRankingStrategy`)**: Permite cambiar en tiempo de ejecución el algoritmo de ordenamiento de resultados entre **Ranking por Relevancia** (`DefaultRankingStrategy`) y **Ranking por Estrenos Recientes** (`RecencyRankingStrategy`).
+4. **Observer (`IProfileObserver`)**: Conecta `UserProfile` con `GuiProfileObserver` para refrescar automáticamente las listas de *Likes*, *Ver más tarde* y *Recomendaciones* en pantalla cada vez que el usuario interactúa con una película.
 
-```bash
-mkdir build && cd build
-cmake .. -DCMAKE_BUILD_TYPE=Release
-make -j4
-./plataforma_peliculas ../data/wiki_movie_plots_deduped.csv
-```
+### 3. Programación Paralela (`std::async` / `std::future`)
+* **Indexación concurrente (`SearchEngine::buildIndexes`)**: Construye los 4 índices (`contentIndex_`, `directorIndex_`, `castIndex_`, `genreIndex_`) y sus respectivos `SuffixTrie` en 4 hilos simultáneos.
+* **Búsqueda multi-término paralela (`SearchEngine::rankAndCombine`)**: Cada palabra de una consulta compuesta se busca en paralelo en el `SuffixTrie` mediante `std::future` independientes, combinando los mapas de puntaje sin bloqueos por `mutex`.
+* **Recomendaciones por bloques (`UserProfile::recommendSimilarToLikes`)**: Divide el catálogo entre los núcleos disponibles (`std::thread::hardware_concurrency()`) para calcular la similitud de Jaccard en paralelo.
 
-El segundo argumento (opcional) limita cuántas filas cargar, útil para probar rápido durante el desarrollo:
-```bash
-./plataforma_peliculas ../data/wiki_movie_plots_deduped.csv 3000
-```
+### 4. Interfaz Gráfica (`src/main_gui.cpp`)
+* Construida con **Dear ImGui + GLFW + OpenGL3** (descargados automáticamente por CMake mediante `FetchContent`).
+* Incluye selector de tipo de búsqueda, cambio de estrategia de ranking en vivo, control de **Zoom dinámico** (`Ctrl + Rueda del ratón` o deslizador `0.8x–1.8x`), paginación de 5 en 5 resultados y persistencia automática en `user_profile.txt`.
 
-**Rendimiento medido** (dataset completo, ~34,886 películas, laptop de gama media): construir todos los índices toma ~15-20 segundos y usa ~1.3 GB de RAM; una vez construidos, cada búsqueda es prácticamente instantánea (milisegundos).
+---
 
-### Uso
+## Dataset
 
-Al iniciar, si el usuario ya tiene películas en **Ver más tarde** o **Likes** (persistidos en `user_profile.txt` entre ejecuciones), se muestran automáticamente junto con recomendaciones. Luego, un menú permite:
+Se utilizó el dataset de Wikipedia Movie Plots (`wiki_movie_plots_deduped.csv`, ~34,886 películas válidas tras limpieza). Por su tamaño (~78 MB), el archivo completo no se incluye en el repositorio; descárgalo y colócalo en `data/wiki_movie_plots_deduped.csv`. Para pruebas rápidas sin descargar el dataset completo, el repositorio incluye `data/muestra_100_peliculas.csv`.
 
-1. Buscar por palabra, frase o sub-cadena (busca en título + sinopsis).
-2. Buscar por director.
-3. Buscar por actor/actriz.
-4. Buscar por género.
-5. Ver Likes y recomendaciones.
-6. Salir.
+**Preprocesamiento aplicado (`CSVReader` + `TextUtils`):**
+* Descarte de filas sin título.
+* Normalización de `"unknown"` o vacíos en `Genre` y `Director`.
+* Conversión a minúsculas, limpieza de diacríticos UTF-8 y tokenización alfanumérica.
 
-Los resultados se muestran de 5 en 5 (ordenados por importancia), con la opción de ver las siguientes 5, o seleccionar una película para ver su sinopsis completa y marcarla como **Like** o **Ver más tarde**.
+---
 
-### Estructura del repositorio
+## Cómo compilar y ejecutar
 
-```
-include/        Headers (interfaces) de cada componente
-src/            Implementación (.cpp) de cada componente + main.cpp
-data/           (vacío en el repo) coloca aquí el CSV del dataset
-docs/           Documentación de arquitectura y mapeo a la rúbrica
-CMakeLists.txt  Build del proyecto
-```
+### Requisitos
+* Compilador compatible con **C++17** (GCC/MinGW, Clang o MSVC) y **CMake 3.16+**.
+* En Linux (Ubuntu/Debian), instalar dependencias gráficas si no están presentes:
+  ```bash
+  sudo apt-get install libgl1-mesa-dev libxrandr-dev libxinerama-dev libxcursor-dev libxi-dev
+  ```
+### Compilación
+  ```bash
+  mkdir build && cd build
+  cmake .. -DCMAKE_BUILD_TYPE=Release
+  cmake --build . -j4
+  ```
+### Ejecución
+  ```bash
+  # Ejecutar con el dataset completo (~34,886 películas):
+  ./plataforma_peliculas ../data/wiki_movie_plots_deduped.csv
+  # Ejecutar con el dataset de muestra (100 películas, arranque instantáneo):
+  ./plataforma_peliculas ../data/muestra_100_peliculas.csv
+  # Opcional: limitar el número de filas a cargar (ej. primeras 3,000 películas):
+  ./plataforma_peliculas ../data/wiki_movie_plots_deduped.csv 3000
+  ```
+---
 
-### Estado del proyecto / próximos pasos
-
-Esta entrega cubre funcionalmente los 6 puntos del enunciado (ver `docs/RUBRICA.md`) con un algoritmo de importancia y uno de recomendación propios, ya probados contra el dataset real completo. Pendiente para el avance final: pruebas unitarias formales, un mejor manejo de sinónimos/errores de tipeo en la búsqueda, y — si el equipo lo considera necesario — una interfaz gráfica en vez de la consola.
